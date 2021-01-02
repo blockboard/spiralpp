@@ -21,6 +21,7 @@ import threading
 import time
 import timeit
 import traceback
+import random
 
 os.environ["OMP_NUM_THREADS"] = "1"  # Necessary for multithreading.
 
@@ -98,6 +99,8 @@ parser.add_argument("--num_inference_threads", default=2, type=int,
                     metavar="N", help="Number learner threads.")
 parser.add_argument("--disable_cuda", action="store_true",
                     help="Disable CUDA.")
+parser.add_argument("--replay_buffer_size", default=None, type=int, metavar="N",
+                    help="Replay buffer size. Defaults to batch_size * 20.")
 parser.add_argument("--max_learner_queue_size", default=None, type=int, metavar="N",
                     help="Optional maximum learner queue size. Defaults to batch_size.")
 parser.add_argument("--unroll_length", default=20, type=int, metavar="T",
@@ -173,6 +176,59 @@ def compute_policy_gradient_loss(logits, actions, advantages):
     return torch.sum(cross_entropy * advantages.detach())
 
 
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = []
+
+        self.capacity = capacity
+        self.position = 0
+
+    def push(self, frame):
+        frames = frame.split(1)
+        request = len(frames)
+
+        free = self.capacity - self.position
+        available = len(self.buffer) - self.position
+        if available < free:
+            if request > self.capacity:
+                size = free
+            else:
+                size = request
+            self.buffer.extend([None for _ in range(size)])
+
+        if request > free:
+            self.buffer[self.position :] = frames[:free]
+
+            frames = frames[free:]
+
+            self.position = 0
+
+            request -= free
+
+        self.buffer[self.position : self.position + request] = frames
+        self.position = (self.position + request) % self.capacity
+
+    def sample(self, batch_size):
+        frames = random.sample(self.buffer, batch_size)
+
+        return torch.cat(frames)
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def checkpoint(self):
+        return dict(
+            buffer=torch.cat(self.buffer),
+            position=self.position,
+            capacity=self.capacity,
+        )
+
+    def load_checkpoint(self, checkpoint):
+        self.buffer = list(checkpoint["buffer"].split(1))
+        self.position = checkpoint["position"]
+        self.capacity = checkpoint["capacity"]
+
+
 def inference(flags, inference_batcher, model, lock=threading.Lock()):
     with torch.no_grad():
         for batch in inference_batcher:
@@ -222,7 +278,7 @@ def reward_function(flags, done, new_frame, D):
             flags.unroll_length + 1, flags.batch_size, device=flags.learner_device
         )
 
-        reward[index[:, 0], index[:, 1]] += torch.log(D(new_frame) + 1e-12)
+        reward[index[:, 0], index[:, 1]] += D(new_frame)
 
     return reward
 
@@ -354,6 +410,7 @@ def learn(
             ).item()
 
         plogger.log(stats)
+        stats["n_discriminator_updates"] = 0
         lock.release()
 
 
@@ -365,6 +422,7 @@ def learn_D(
     flags,
     dataloader,
     replay_queue,
+    replay_buffer,
     D,
     D_eval,
     optimizer,
@@ -373,9 +431,6 @@ def learn_D(
 ):
     while True:
         for real, _ in dataloader:
-            fake = next(replay_queue)["canvas"].squeeze(0)
-            fake = fake.to(flags.learner_device, non_blocking=True)
-
             real = real.to(flags.learner_device, non_blocking=True)
 
             if flags.condition:
@@ -391,6 +446,11 @@ def learn_D(
             real_loss = F.binary_cross_entropy_with_logits(p_real, label)
 
             D_x = torch.sigmoid(p_real).mean()
+
+            fake = replay_buffer.sample(flags.batch_size).to(
+                flags.learner_device, non_blocking=True
+            )
+
             p_fake = D(fake).view(-1)
 
             label = torch.full(
@@ -413,6 +473,9 @@ def learn_D(
             stats["real_loss"] = real_loss.item()
             stats["D_x"] = D_x.item()
             stats["D_G_z1"] = D_G_z1.item()
+            stats["n_discriminator_updates"] = (
+                stats.get("n_discriminator_updates", 0) + 1
+            )
 
             if replay_queue.is_closed():
                 return
@@ -461,6 +524,11 @@ def train(flags):
         check_inputs=True,
         maximum_queue_size=flags.batch_size,
     )
+
+    if flags.replay_buffer_size is None:
+        flags.replay_buffer_size = flags.batch_size * 20
+
+    replay_buffer = ReplayBuffer(flags.replay_buffer_size)
 
     # The "batcher", a queue for the inference call. Will yield
     # "batch" objects with `get_inputs` and `set_outputs` methods.
@@ -590,6 +658,7 @@ def train(flags):
         D_optimizer.load_state_dict(checkpoint_states["D_optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint_states["scheduler_state_dict"])
         stats = checkpoint_states["stats"]
+        replay_buffer.load_checkpoint(checkpoint_states["replay_buffer"])
         logging.info(f"Resuming preempted job, current stats:\n{stats}")
 
     # Initialize actor model like learner model.
@@ -635,6 +704,7 @@ def train(flags):
             flags,
             dataloader,
             replay_queue,
+            replay_buffer,
             D,
             D_eval,
             D_optimizer,
@@ -643,6 +713,21 @@ def train(flags):
         ),
     )
 
+    def load_replay_buffer(replay_queue, replay_buffer):
+        for obs in replay_queue:
+            replay_buffer.push(obs["canvas"].squeeze(0))
+
+    replay_buffer_loader = threading.Thread(
+        target=load_replay_buffer,
+        name="replay-buffer-loader-thread",
+        args=(
+            replay_queue,
+            replay_buffer,
+        ),
+    )
+    replay_buffer_loader.daemon = True
+
+    replay_buffer_loader.start()
     actorpool_thread.start()
 
     threads = learner_threads + inference_threads
@@ -663,6 +748,7 @@ def train(flags):
                 "scheduler_state_dict": scheduler.state_dict(),
                 "stats": stats,
                 "flags": vars(flags),
+                "replay_buffer": replay_buffer.checkpoint(),
             },
             checkpointpath,
         )
@@ -671,7 +757,7 @@ def train(flags):
         return f"{x:1.5}" if isinstance(x, float) else str(x)
 
     try:
-        while replay_queue.size() < flags.batch_size:
+        while len(replay_buffer) < flags.batch_size:
             if learner_queue.size() >= flags.batch_size:
                 next(learner_queue)
             time.sleep(0.01)
