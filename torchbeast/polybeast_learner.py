@@ -116,6 +116,8 @@ parser.add_argument("--baseline_cost", default=0.5, type=float,
                     help="Baseline cost/multiplier.")
 parser.add_argument("--discounting", default=0.99, type=float,
                     help="Discounting factor.")
+parser.add_argument("--gp_weight", default=10.0, type=float,
+                    help="Gradient penalty weight.")
 
 # Optimizer settings.
 parser.add_argument("--policy_learning_rate", default=0.0003, type=float,
@@ -357,10 +359,6 @@ def learn(
         lock.release()
 
 
-real_label = 1.0
-fake_label = 0.0
-
-
 def learn_D(
     flags,
     dataloader,
@@ -385,22 +383,35 @@ def learn_D(
 
             p_real = D(real).view(-1)
 
-            label = torch.full(
-                (flags.batch_size,), real_label, device=flags.learner_device
-            )
-            real_loss = F.binary_cross_entropy_with_logits(p_real, label)
-
-            D_x = torch.sigmoid(p_real).mean()
             p_fake = D(fake).view(-1)
 
-            label = torch.full(
-                (flags.batch_size,), fake_label, device=flags.learner_device
-            )
-            fake_loss = F.binary_cross_entropy_with_logits(p_fake, label)
+            critic_loss = -torch.mean(p_real) + torch.mean(p_fake)
 
-            D_G_z1 = torch.sigmoid(p_fake).mean()
+            if flags.gp_weight == 0.0:
+                grad_penalty = 0.0
+            else:
+                alpha = torch.rand(
+                    (flags.batch_size, 1, 1, 1), device=flags.learner_device
+                )
+                diff = real - fake
+                interpolate = fake + alpha * diff
 
-            loss = real_loss + fake_loss
+                p_interpolate = D(interpolate)
+
+                # Creates gradients
+                grad_params = torch.autograd.grad(
+                    torch.sum(p_interpolate), D.parameters(), create_graph=True
+                )
+
+                # Computes the penalty term and adds it to the loss
+                grad_norm = 0
+                for grad in grad_params:
+                    grad_norm += grad.pow(2).sum()
+                grad_norm = grad_norm.sqrt()
+
+                grad_penalty = flags.gp_weight * grad_norm.sub(1).pow(2)
+
+            loss = critic_loss + grad_penalty
 
             loss.backward()
 
@@ -409,10 +420,8 @@ def learn_D(
             D_eval.load_state_dict(D.state_dict())
 
             stats["D_loss"] = loss.item()
-            stats["fake_loss"] = fake_loss.item()
-            stats["real_loss"] = real_loss.item()
-            stats["D_x"] = D_x.item()
-            stats["D_G_z1"] = D_G_z1.item()
+            stats["critic_loss"] = critic_loss.item()
+            stats["grad_penalty"] = grad_penalty.item()
 
             if replay_queue.is_closed():
                 return
